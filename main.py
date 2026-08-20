@@ -1,14 +1,17 @@
-from fastapi import FastAPI
-import re
+
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.preprocessing.text import Tokenizer
+from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from keras.models import load_model
+import numpy as np
 import pickle
+import re
 
-app =  FastAPI()
-
-@app.get('/')
-def greet():
-    return {'Hello sahil'}
 
 """
 1. We are going to make some constants like:
@@ -88,9 +91,10 @@ Load the model and toknizer once the server starts up.
 """
 dl_model = {} #{1. BiGRU, 2. Tokenizer}-> True , {} -> False
 
+@asynccontextmanager
 async def lifespan(app:FastAPI):
     print('Loading the model and tokenizer...')
-    dl_model["BiGRU"] = load_model(model_path)                      #BiGRU Model
+    dl_model["BiGRU"] = load_model(model_path) #BiGRU Model
     with open(tokenizer_path, 'rb') as file:
         dl_model["Tokenizer"] = pickle.load(file)
     print('Model are loaded successfully...')   
@@ -98,4 +102,81 @@ async def lifespan(app:FastAPI):
     yield #Pause, model is laoded and server is running and at this point model wait karega for request
 
     dl_model.clear() #Ek baar server band ho gaya uske baad model ko memory se hata do.
-               
+
+"""
+5. Mounth the static file to the fastApi app
+A. enable CORS(cross-origin resource sharing) to allow request from different origin 
+"""
+app = FastAPI(
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+app.mount('/static', StaticFiles(directory="static"), name="static")
+
+"""
+6. API Endpoints.
+A. Server UI at homepage ('/')
+B. Health Check Endpoint ('/health')
+C. Predict Emotion Endpoint ('/predict')
+"""
+
+#A. Server UI at homepage ('/')
+@app.get('/', include_in_schema=False)
+def serve_ui():
+    return FileResponse('static/index.html')
+
+# B. Health Check Endpoint ('/health')
+@app.get('/health', response_model=HealthResponse)
+def health_check():
+    return HealthResponse(status="Server is running", model_loaded=bool(dl_model))
+
+# C. Predict Emotion Endpoint ('/predict')
+@app.post('/predict', response_model=PredictionResponse)
+def predict_emotion(text_input:TextInput):
+    """
+    1. Cleans the input sentences.
+    2. Convert the words into numeric using tokenizer.
+    3. Pad the sequences to ensure uniform length.
+    4. Run prediction using the BiGRU model.
+    5. Return the top emotion and full probability breakdown.
+    """
+    
+    BiGRU_model     = dl_model.get("BiGRU")
+    tokenizer_model = dl_model.get("Tokenizer")
+
+    if BiGRU_model is None or tokenizer_model is None:
+        raise HTTPException(status_code=503, detail="Model is not loaded yet. Please try again later.")
+    
+    #1
+    cleaned_text = preprocess_text(text_input.text)
+    
+    #2 and 3
+    tokenized_text = tokenizer_model.texts_to_sequences([cleaned_text])
+    padded_sequence = pad_sequences(
+        tokenized_text,
+        maxlen=max_sequence_length,
+        padding="post",
+        truncating="post"
+    )
+    
+    #4
+    probabilites = BiGRU_model.predict(padded_sequence)[0]
+    top_emotion_index = int(np.argmax(probabilites))
+    all_probabilites = {
+        label : float(prob) for prob, label in zip(probabilites,emotion_labels)
+    }
+    
+    return PredictionResponse(
+        text = text_input.text,
+        predicted_emotion = emotion_labels[top_emotion_index],
+        confidence = float(probabilites[top_emotion_index]), 
+        all_probabilites = all_probabilites
+    )
